@@ -157,6 +157,10 @@
                 startWebSocketMirror(event.data.url);
             } else if (event.data.type === 'STOP') {
                 stopAll();
+                // Close the Cast receiver session
+                setTimeout(() => {
+                    context.stop();
+                }, 500);
             }
         });
 
@@ -599,7 +603,7 @@
 
         context.start(options);
         console.log('Flujo Cast Receiver started - supports HLS + WebSocket mirroring');
-        updateStatus('Receiver v2.4 ready');
+        updateStatus('Receiver v2.5 ready');
         updateStatus('Waiting for content...');
     </script>
 </body>
