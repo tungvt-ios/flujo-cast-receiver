@@ -370,6 +370,12 @@
 
         // ==================== AUDIO STREAMING ====================
 
+        let audioQueue = [];
+        let nextPlayTime = 0;
+        let audioStarted = false;
+        const MAX_QUEUE_SIZE = 10;
+        const BUFFER_AHEAD = 0.1; // 100ms buffer ahead
+
         function startAudioWebSocket(videoUrl) {
             // Derive audio URL from video URL (port 9081 -> 9082)
             const audioUrl = videoUrl.replace(':9081', ':9082');
@@ -381,12 +387,16 @@
             console.log('Starting audio WebSocket:', audioUrl);
             updateStatus('Audio connecting...');
 
-            // Initialize AudioContext
+            // Initialize AudioContext (let browser choose optimal sample rate)
             if (!audioContext) {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)({
-                    sampleRate: 44100
-                });
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                console.log('AudioContext created, sampleRate:', audioContext.sampleRate);
             }
+
+            // Reset audio state
+            audioQueue = [];
+            nextPlayTime = 0;
+            audioStarted = false;
 
             try {
                 audioWebsocket = new WebSocket(audioUrl);
@@ -407,7 +417,7 @@
 
             audioWebsocket.onmessage = (event) => {
                 if (event.data instanceof ArrayBuffer && audioContext) {
-                    playAudioData(event.data);
+                    processAudioChunk(event.data);
                 }
             };
 
@@ -417,31 +427,70 @@
 
             audioWebsocket.onclose = () => {
                 console.log('Audio WebSocket closed');
+                audioStarted = false;
             };
         }
 
-        function playAudioData(data) {
-            // Decode audio data (assuming PCM format)
-            try {
-                const int16Array = new Int16Array(data);
-                const float32Array = new Float32Array(int16Array.length);
+        function processAudioChunk(data) {
+            if (data.byteLength < 10) return;
 
-                // Convert Int16 to Float32 (-1.0 to 1.0)
-                for (let i = 0; i < int16Array.length; i++) {
-                    float32Array[i] = int16Array[i] / 32768.0;
+            const view = new DataView(data);
+            // Header: sampleRate(4) + channels(2) + dataLength(4) = 10 bytes
+            const sampleRate = view.getUint32(0, true);
+            const channels = view.getUint16(4, true);
+            const dataLength = view.getUint32(6, true);
+
+            if (sampleRate === 0 || channels === 0 || dataLength === 0) return;
+            if (data.byteLength < 10 + dataLength) return;
+
+            // Limit queue size to prevent memory buildup
+            if (audioQueue.length >= MAX_QUEUE_SIZE) {
+                audioQueue.shift(); // Drop oldest
+            }
+
+            try {
+                // Calculate samples: each sample is 2 bytes (Int16) per channel
+                const samples = Math.floor(dataLength / (2 * channels));
+                if (samples === 0) return;
+
+                const audioBuffer = audioContext.createBuffer(channels, samples, sampleRate);
+
+                // Convert Int16 PCM to Float32
+                for (let c = 0; c < channels; c++) {
+                    const channelData = audioBuffer.getChannelData(c);
+                    for (let i = 0; i < samples; i++) {
+                        // Interleaved format: [L0,R0,L1,R1,...] or mono: [S0,S1,...]
+                        const byteOffset = 10 + (i * channels + c) * 2;
+                        const sample = view.getInt16(byteOffset, true);
+                        channelData[i] = sample / 32768.0;
+                    }
                 }
 
-                // Create audio buffer
-                const audioBuffer = audioContext.createBuffer(1, float32Array.length, 44100);
-                audioBuffer.getChannelData(0).set(float32Array);
-
-                // Play audio
-                const source = audioContext.createBufferSource();
-                source.buffer = audioBuffer;
-                source.connect(audioContext.destination);
-                source.start();
+                // Queue and schedule
+                audioQueue.push(audioBuffer);
+                scheduleAudio();
             } catch (e) {
-                // Silently ignore audio decode errors
+                console.error('Audio processing error:', e);
+            }
+        }
+
+        function scheduleAudio() {
+            while (audioQueue.length > 0) {
+                const buffer = audioQueue.shift();
+                const source = audioContext.createBufferSource();
+                source.buffer = buffer;
+                source.connect(audioContext.destination);
+
+                const currentTime = audioContext.currentTime;
+
+                if (!audioStarted || nextPlayTime < currentTime) {
+                    // First buffer or fell behind - start fresh with small buffer
+                    nextPlayTime = currentTime + BUFFER_AHEAD;
+                    audioStarted = true;
+                }
+
+                source.start(nextPlayTime);
+                nextPlayTime += buffer.duration;
             }
         }
 
@@ -454,6 +503,9 @@
                 audioContext.close();
                 audioContext = null;
             }
+            audioQueue = [];
+            audioStarted = false;
+            nextPlayTime = 0;
         }
 
         // ==================== UTILITIES ====================
@@ -537,7 +589,7 @@
 
         context.start(options);
         console.log('Flujo Cast Receiver started - supports HLS + WebSocket mirroring');
-        updateStatus('Receiver v2.0 ready');
+        updateStatus('Receiver v2.1 ready');
         updateStatus('Waiting for content...');
     </script>
 </body>
