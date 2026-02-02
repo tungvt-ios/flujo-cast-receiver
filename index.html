@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flujo Cast Receiver</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            background: #000;
+            overflow: hidden;
+            width: 100vw;
+            height: 100vh;
+        }
+        #player {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 24px;
+            text-align: center;
+        }
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid rgba(255,255,255,0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        #error {
+            display: none;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #ff6b6b;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 20px;
+            text-align: center;
+            padding: 20px;
+        }
+    </style>
+</head>
+<body>
+    <video id="player" autoplay playsinline></video>
+
+    <div id="loading">
+        <div class="spinner"></div>
+        <div>Connecting...</div>
+    </div>
+
+    <div id="error">
+        <div>Failed to load stream</div>
+        <div id="errorDetail" style="font-size: 14px; margin-top: 10px; opacity: 0.7;"></div>
+    </div>
+
+    <!-- HLS.js for HLS stream support -->
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
+
+    <!-- Google Cast Receiver SDK -->
+    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+    <script>
+        const player = document.getElementById('player');
+        const loading = document.getElementById('loading');
+        const errorDiv = document.getElementById('error');
+        const errorDetail = document.getElementById('errorDetail');
+
+        let hls = null;
+
+        // Initialize Cast Receiver
+        const context = cast.framework.CastReceiverContext.getInstance();
+        const playerManager = context.getPlayerManager();
+
+        // Custom message namespace for communication with sender
+        const NAMESPACE = 'urn:x-cast:com.flujo.iptv';
+
+        // Handle incoming messages from sender app
+        context.addCustomMessageListener(NAMESPACE, (event) => {
+            console.log('Received message:', event.data);
+
+            if (event.data.type === 'LOAD_STREAM') {
+                loadStream(event.data.url, event.data.title);
+            } else if (event.data.type === 'STOP') {
+                stopPlayback();
+            }
+        });
+
+        // Intercept LOAD requests to handle HLS streams
+        playerManager.setMessageInterceptor(
+            cast.framework.messages.MessageType.LOAD,
+            (loadRequestData) => {
+                const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
+                console.log('Load request for:', url);
+
+                // Check if this is an HLS stream
+                if (url && (url.includes('.m3u8') || url.includes('m3u8'))) {
+                    // Handle HLS with HLS.js
+                    loadStream(url, loadRequestData.media.metadata?.title);
+                    // Return null to prevent default player from handling it
+                    return null;
+                }
+
+                // For non-HLS content, let default player handle it
+                return loadRequestData;
+            }
+        );
+
+        // Load HLS stream using HLS.js
+        function loadStream(url, title) {
+            console.log('Loading HLS stream:', url);
+
+            showLoading();
+            hideError();
+
+            // Cleanup previous instance
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    backBufferLength: 90
+                });
+
+                hls.loadSource(url);
+                hls.attachMedia(player);
+
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    console.log('Manifest parsed, starting playback');
+                    hideLoading();
+                    player.play().catch(e => console.error('Playback error:', e));
+                });
+
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    console.error('HLS error:', data);
+                    if (data.fatal) {
+                        switch (data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                console.log('Network error, trying to recover...');
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                console.log('Media error, trying to recover...');
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                showError('Stream error: ' + data.details);
+                                hls.destroy();
+                                break;
+                        }
+                    }
+                });
+
+            } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
+                // Native HLS support (Safari/iOS)
+                player.src = url;
+                player.addEventListener('loadedmetadata', () => {
+                    hideLoading();
+                    player.play();
+                });
+                player.addEventListener('error', () => {
+                    showError('Failed to load stream');
+                });
+            } else {
+                showError('HLS not supported on this device');
+            }
+        }
+
+        function stopPlayback() {
+            if (hls) {
+                hls.destroy();
+                hls = null;
+            }
+            player.src = '';
+            showLoading();
+        }
+
+        function showLoading() {
+            loading.style.display = 'block';
+        }
+
+        function hideLoading() {
+            loading.style.display = 'none';
+        }
+
+        function showError(message) {
+            hideLoading();
+            errorDiv.style.display = 'block';
+            errorDetail.textContent = message;
+        }
+
+        function hideError() {
+            errorDiv.style.display = 'none';
+        }
+
+        // Player event listeners
+        player.addEventListener('playing', () => {
+            hideLoading();
+            hideError();
+        });
+
+        player.addEventListener('waiting', () => {
+            showLoading();
+        });
+
+        player.addEventListener('error', (e) => {
+            console.error('Player error:', e);
+            showError('Playback error');
+        });
+
+        // Start the receiver
+        const options = new cast.framework.CastReceiverOptions();
+        options.disableIdleTimeout = true;
+
+        context.start(options);
+        console.log('Cast Receiver started');
+    </script>
+</body>
+</html>
