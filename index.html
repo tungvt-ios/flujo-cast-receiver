@@ -72,10 +72,15 @@
             position: absolute;
             bottom: 20px;
             left: 20px;
-            color: rgba(255,255,255,0.5);
+            color: rgba(255,255,255,0.7);
             font-family: monospace;
-            font-size: 12px;
-            display: none;
+            font-size: 14px;
+            display: block;
+            background: rgba(0,0,0,0.5);
+            padding: 10px;
+            border-radius: 5px;
+            max-width: 80%;
+            word-wrap: break-word;
         }
     </style>
 </head>
@@ -145,8 +150,10 @@
         // Handle Mirror messages
         context.addCustomMessageListener(MIRROR_NAMESPACE, (event) => {
             console.log('Mirror message:', event.data);
+            updateStatus('Mirror msg: ' + event.data.type);
 
             if (event.data.type === 'START_MIRROR') {
+                updateStatus('Start mirror: ' + event.data.url);
                 startWebSocketMirror(event.data.url);
             } else if (event.data.type === 'STOP') {
                 stopAll();
@@ -158,12 +165,16 @@
             cast.framework.messages.MessageType.LOAD,
             (loadRequestData) => {
                 const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
-                console.log('Load request for:', url);
+                console.log('=== LOAD INTERCEPTED ===');
+                console.log('URL:', url);
+                console.log('Full media:', JSON.stringify(loadRequestData.media));
+                updateStatus('Received: ' + (url || 'no url').substring(0, 50));
 
                 if (!url) return loadRequestData;
 
                 // Check if WebSocket URL (for screen mirroring)
                 if (url.startsWith('ws://') || url.startsWith('wss://')) {
+                    console.log('Detected WebSocket URL');
                     startWebSocketMirror(url);
                     return null;
                 }
@@ -178,14 +189,25 @@
                     return null;
                 }
 
+                // Check contentType for websocket
+                if (loadRequestData.media.contentType === 'application/x-websocket') {
+                    console.log('Detected websocket contentType, converting URL');
+                    const wsUrl = url.replace('http://', 'ws://').replace('https://', 'wss://');
+                    startWebSocketMirror(wsUrl.startsWith('ws') ? wsUrl : 'ws://' + url.replace(/^https?:\/\//, ''));
+                    return null;
+                }
+
                 // Check if HLS stream
                 if (url.includes('.m3u8') || url.includes('m3u8')) {
+                    console.log('Detected HLS stream');
                     loadHLSStream(url, loadRequestData.media.metadata?.title);
                     return null;
                 }
 
-                // For other content, let default player handle it
-                return loadRequestData;
+                // Unknown URL type - show error instead of letting default player fail
+                console.log('Unknown URL type, showing error');
+                showError('Unsupported URL: ' + url.substring(0, 50));
+                return null;
             }
         );
 
@@ -248,19 +270,27 @@
 
         function startWebSocketMirror(url) {
             console.log('Starting WebSocket mirror:', url);
+            updateStatus('WS connecting: ' + url);
             stopAll();
             currentMode = 'websocket';
 
             showLoading('Connecting to screen...');
             mirrorImg.style.display = 'block';
 
-            websocket = new WebSocket(url);
-            websocket.binaryType = 'arraybuffer';
+            try {
+                websocket = new WebSocket(url);
+                websocket.binaryType = 'arraybuffer';
+            } catch (e) {
+                console.error('WebSocket creation error:', e);
+                updateStatus('WS create error: ' + e.message);
+                showError('Failed to create WebSocket: ' + e.message);
+                return;
+            }
 
             websocket.onopen = () => {
                 console.log('WebSocket connected');
                 hideLoading();
-                updateStatus('Connected');
+                updateStatus('WS Connected!');
             };
 
             websocket.onmessage = (event) => {
@@ -280,11 +310,13 @@
 
             websocket.onerror = (error) => {
                 console.error('WebSocket error:', error);
-                showError('Connection error');
+                updateStatus('WS Error');
+                showError('WebSocket connection failed');
             };
 
             websocket.onclose = (event) => {
-                console.log('WebSocket closed:', event.code);
+                console.log('WebSocket closed:', event.code, event.reason);
+                updateStatus('WS Closed: ' + event.code);
                 if (currentMode === 'websocket') {
                     // Try to reconnect after 2 seconds
                     setTimeout(() => {
@@ -372,8 +404,11 @@
             errorDiv.style.display = 'none';
         }
 
+        let statusHistory = [];
         function updateStatus(text) {
-            statusDiv.textContent = text;
+            statusHistory.push(text);
+            if (statusHistory.length > 5) statusHistory.shift();
+            statusDiv.innerHTML = statusHistory.join('<br>');
             statusDiv.style.display = 'block';
         }
 
@@ -400,6 +435,8 @@
 
         context.start(options);
         console.log('Flujo Cast Receiver started - supports HLS + WebSocket mirroring');
+        updateStatus('Receiver v2.0 ready');
+        updateStatus('Waiting for content...');
     </script>
 </body>
 </html>
