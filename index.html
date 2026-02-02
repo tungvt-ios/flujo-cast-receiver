@@ -20,6 +20,19 @@
             width: 100%;
             height: 100%;
             object-fit: contain;
+            display: none;
+        }
+        #mirrorCanvas {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
+        }
+        #mirrorImg {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: none;
         }
         #loading {
             position: absolute;
@@ -55,20 +68,36 @@
             text-align: center;
             padding: 20px;
         }
+        #status {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: rgba(255,255,255,0.5);
+            font-family: monospace;
+            font-size: 12px;
+            display: none;
+        }
     </style>
 </head>
 <body>
+    <!-- Video player for HLS streams -->
     <video id="player" autoplay playsinline></video>
+
+    <!-- Canvas/Image for Screen Mirroring -->
+    <canvas id="mirrorCanvas"></canvas>
+    <img id="mirrorImg" alt="Screen Mirror">
 
     <div id="loading">
         <div class="spinner"></div>
-        <div>Connecting...</div>
+        <div id="loadingText">Connecting...</div>
     </div>
 
     <div id="error">
-        <div>Failed to load stream</div>
+        <div>Connection Failed</div>
         <div id="errorDetail" style="font-size: 14px; margin-top: 10px; opacity: 0.7;"></div>
     </div>
+
+    <div id="status"></div>
 
     <!-- HLS.js for HLS stream support -->
     <script src="https://cdn.jsdelivr.net/npm/hls.js@1.4.12/dist/hls.min.js"></script>
@@ -77,63 +106,98 @@
     <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
 
     <script>
+        // Elements
         const player = document.getElementById('player');
+        const mirrorCanvas = document.getElementById('mirrorCanvas');
+        const mirrorImg = document.getElementById('mirrorImg');
         const loading = document.getElementById('loading');
+        const loadingText = document.getElementById('loadingText');
         const errorDiv = document.getElementById('error');
         const errorDetail = document.getElementById('errorDetail');
+        const statusDiv = document.getElementById('status');
 
+        // State
         let hls = null;
+        let websocket = null;
+        let currentMode = null; // 'hls', 'websocket', 'mjpeg'
+        let frameCount = 0;
+        let lastFpsUpdate = Date.now();
 
         // Initialize Cast Receiver
         const context = cast.framework.CastReceiverContext.getInstance();
         const playerManager = context.getPlayerManager();
 
-        // Custom message namespace for communication with sender
-        const NAMESPACE = 'urn:x-cast:com.flujo.iptv';
+        // Custom message namespaces
+        const IPTV_NAMESPACE = 'urn:x-cast:com.flujo.iptv';
+        const MIRROR_NAMESPACE = 'urn:x-cast:com.flujo.mirror';
 
-        // Handle incoming messages from sender app
-        context.addCustomMessageListener(NAMESPACE, (event) => {
-            console.log('Received message:', event.data);
+        // Handle IPTV messages
+        context.addCustomMessageListener(IPTV_NAMESPACE, (event) => {
+            console.log('IPTV message:', event.data);
 
             if (event.data.type === 'LOAD_STREAM') {
-                loadStream(event.data.url, event.data.title);
+                loadHLSStream(event.data.url, event.data.title);
             } else if (event.data.type === 'STOP') {
-                stopPlayback();
+                stopAll();
             }
         });
 
-        // Intercept LOAD requests to handle HLS streams
+        // Handle Mirror messages
+        context.addCustomMessageListener(MIRROR_NAMESPACE, (event) => {
+            console.log('Mirror message:', event.data);
+
+            if (event.data.type === 'START_MIRROR') {
+                startWebSocketMirror(event.data.url);
+            } else if (event.data.type === 'STOP') {
+                stopAll();
+            }
+        });
+
+        // Intercept LOAD requests
         playerManager.setMessageInterceptor(
             cast.framework.messages.MessageType.LOAD,
             (loadRequestData) => {
                 const url = loadRequestData.media.contentId || loadRequestData.media.contentUrl;
                 console.log('Load request for:', url);
 
-                // Check if this is an HLS stream
-                if (url && (url.includes('.m3u8') || url.includes('m3u8'))) {
-                    // Handle HLS with HLS.js
-                    loadStream(url, loadRequestData.media.metadata?.title);
-                    // Return null to prevent default player from handling it
+                if (!url) return loadRequestData;
+
+                // Check if WebSocket URL (for screen mirroring)
+                if (url.startsWith('ws://') || url.startsWith('wss://')) {
+                    startWebSocketMirror(url);
                     return null;
                 }
 
-                // For non-HLS content, let default player handle it
+                // Check if HTTP URL for screen mirroring (convert to WebSocket)
+                // Screen mirror URLs typically use ports 9080, 9081, etc.
+                if ((url.startsWith('http://') || url.startsWith('https://')) &&
+                    (url.includes(':9080') || url.includes(':9081') || url.includes(':8765'))) {
+                    const wsUrl = url.replace('http://', 'ws://').replace('https://', 'wss://');
+                    console.log('Converting HTTP to WebSocket:', wsUrl);
+                    startWebSocketMirror(wsUrl);
+                    return null;
+                }
+
+                // Check if HLS stream
+                if (url.includes('.m3u8') || url.includes('m3u8')) {
+                    loadHLSStream(url, loadRequestData.media.metadata?.title);
+                    return null;
+                }
+
+                // For other content, let default player handle it
                 return loadRequestData;
             }
         );
 
-        // Load HLS stream using HLS.js
-        function loadStream(url, title) {
+        // ==================== HLS STREAMING ====================
+
+        function loadHLSStream(url, title) {
             console.log('Loading HLS stream:', url);
+            stopAll();
+            currentMode = 'hls';
 
-            showLoading();
-            hideError();
-
-            // Cleanup previous instance
-            if (hls) {
-                hls.destroy();
-                hls = null;
-            }
+            showLoading('Loading stream...');
+            player.style.display = 'block';
 
             if (Hls.isSupported()) {
                 hls = new Hls({
@@ -147,7 +211,7 @@
                 hls.attachMedia(player);
 
                 hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                    console.log('Manifest parsed, starting playback');
+                    console.log('HLS manifest parsed');
                     hideLoading();
                     player.play().catch(e => console.error('Playback error:', e));
                 });
@@ -157,47 +221,141 @@
                     if (data.fatal) {
                         switch (data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
-                                console.log('Network error, trying to recover...');
                                 hls.startLoad();
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
-                                console.log('Media error, trying to recover...');
                                 hls.recoverMediaError();
                                 break;
                             default:
                                 showError('Stream error: ' + data.details);
-                                hls.destroy();
                                 break;
                         }
                     }
                 });
 
             } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
-                // Native HLS support (Safari/iOS)
                 player.src = url;
                 player.addEventListener('loadedmetadata', () => {
                     hideLoading();
                     player.play();
                 });
-                player.addEventListener('error', () => {
-                    showError('Failed to load stream');
-                });
             } else {
-                showError('HLS not supported on this device');
+                showError('HLS not supported');
             }
         }
 
-        function stopPlayback() {
+        // ==================== WEBSOCKET MIRRORING ====================
+
+        function startWebSocketMirror(url) {
+            console.log('Starting WebSocket mirror:', url);
+            stopAll();
+            currentMode = 'websocket';
+
+            showLoading('Connecting to screen...');
+            mirrorImg.style.display = 'block';
+
+            websocket = new WebSocket(url);
+            websocket.binaryType = 'arraybuffer';
+
+            websocket.onopen = () => {
+                console.log('WebSocket connected');
+                hideLoading();
+                updateStatus('Connected');
+            };
+
+            websocket.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    // Binary frame (JPEG)
+                    displayFrame(event.data);
+                } else if (typeof event.data === 'string') {
+                    // JSON message
+                    try {
+                        const msg = JSON.parse(event.data);
+                        handleWebSocketMessage(msg);
+                    } catch (e) {
+                        console.error('Failed to parse message:', e);
+                    }
+                }
+            };
+
+            websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                showError('Connection error');
+            };
+
+            websocket.onclose = (event) => {
+                console.log('WebSocket closed:', event.code);
+                if (currentMode === 'websocket') {
+                    // Try to reconnect after 2 seconds
+                    setTimeout(() => {
+                        if (currentMode === 'websocket') {
+                            showLoading('Reconnecting...');
+                            startWebSocketMirror(url);
+                        }
+                    }, 2000);
+                }
+            };
+        }
+
+        function handleWebSocketMessage(msg) {
+            if (msg.type === 'config') {
+                console.log('Received config:', msg);
+            } else if (msg.type === 'stats') {
+                updateStatus(`FPS: ${msg.fps || 0}`);
+            }
+        }
+
+        function displayFrame(data) {
+            const blob = new Blob([data], { type: 'image/jpeg' });
+            const url = URL.createObjectURL(blob);
+
+            // Revoke previous URL to prevent memory leak
+            if (mirrorImg.src && mirrorImg.src.startsWith('blob:')) {
+                URL.revokeObjectURL(mirrorImg.src);
+            }
+
+            mirrorImg.src = url;
+
+            // Update FPS counter
+            frameCount++;
+            const now = Date.now();
+            if (now - lastFpsUpdate >= 1000) {
+                const fps = Math.round(frameCount * 1000 / (now - lastFpsUpdate));
+                updateStatus(`FPS: ${fps}`);
+                frameCount = 0;
+                lastFpsUpdate = now;
+            }
+        }
+
+        // ==================== UTILITIES ====================
+
+        function stopAll() {
+            currentMode = null;
+
+            // Stop HLS
             if (hls) {
                 hls.destroy();
                 hls = null;
             }
+            player.style.display = 'none';
             player.src = '';
-            showLoading();
+
+            // Stop WebSocket
+            if (websocket) {
+                websocket.close();
+                websocket = null;
+            }
+            mirrorImg.style.display = 'none';
+            mirrorCanvas.style.display = 'none';
+
+            hideLoading();
+            hideError();
         }
 
-        function showLoading() {
+        function showLoading(text) {
+            loadingText.textContent = text || 'Connecting...';
             loading.style.display = 'block';
+            errorDiv.style.display = 'none';
         }
 
         function hideLoading() {
@@ -214,14 +372,21 @@
             errorDiv.style.display = 'none';
         }
 
-        // Player event listeners
+        function updateStatus(text) {
+            statusDiv.textContent = text;
+            statusDiv.style.display = 'block';
+        }
+
+        // Player events
         player.addEventListener('playing', () => {
             hideLoading();
             hideError();
         });
 
         player.addEventListener('waiting', () => {
-            showLoading();
+            if (currentMode === 'hls') {
+                showLoading('Buffering...');
+            }
         });
 
         player.addEventListener('error', (e) => {
@@ -234,7 +399,7 @@
         options.disableIdleTimeout = true;
 
         context.start(options);
-        console.log('Cast Receiver started');
+        console.log('Flujo Cast Receiver started - supports HLS + WebSocket mirroring');
     </script>
 </body>
 </html>
