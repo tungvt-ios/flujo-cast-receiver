@@ -124,6 +124,8 @@
         // State
         let hls = null;
         let websocket = null;
+        let audioWebsocket = null;
+        let audioContext = null;
         let currentMode = null; // 'hls', 'websocket', 'mjpeg'
         let frameCount = 0;
         let lastFpsUpdate = Date.now();
@@ -290,7 +292,10 @@
             websocket.onopen = () => {
                 console.log('WebSocket connected');
                 hideLoading();
+                hideError();
                 updateStatus('WS Connected!');
+                // Start audio WebSocket
+                startAudioWebSocket(url);
             };
 
             websocket.onmessage = (event) => {
@@ -338,6 +343,10 @@
         }
 
         function displayFrame(data) {
+            // Hide any errors when receiving frames
+            hideError();
+            hideLoading();
+
             const blob = new Blob([data], { type: 'image/jpeg' });
             const url = URL.createObjectURL(blob);
 
@@ -359,6 +368,94 @@
             }
         }
 
+        // ==================== AUDIO STREAMING ====================
+
+        function startAudioWebSocket(videoUrl) {
+            // Derive audio URL from video URL (port 9081 -> 9082)
+            const audioUrl = videoUrl.replace(':9081', ':9082');
+            if (audioUrl === videoUrl) {
+                console.log('Could not derive audio URL from:', videoUrl);
+                return;
+            }
+
+            console.log('Starting audio WebSocket:', audioUrl);
+            updateStatus('Audio connecting...');
+
+            // Initialize AudioContext
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 44100
+                });
+            }
+
+            try {
+                audioWebsocket = new WebSocket(audioUrl);
+                audioWebsocket.binaryType = 'arraybuffer';
+            } catch (e) {
+                console.error('Audio WebSocket creation error:', e);
+                return;
+            }
+
+            audioWebsocket.onopen = () => {
+                console.log('Audio WebSocket connected');
+                updateStatus('Audio connected');
+                // Resume audio context (required for autoplay policy)
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+            };
+
+            audioWebsocket.onmessage = (event) => {
+                if (event.data instanceof ArrayBuffer && audioContext) {
+                    playAudioData(event.data);
+                }
+            };
+
+            audioWebsocket.onerror = (error) => {
+                console.error('Audio WebSocket error:', error);
+            };
+
+            audioWebsocket.onclose = () => {
+                console.log('Audio WebSocket closed');
+            };
+        }
+
+        function playAudioData(data) {
+            // Decode audio data (assuming PCM format)
+            try {
+                const int16Array = new Int16Array(data);
+                const float32Array = new Float32Array(int16Array.length);
+
+                // Convert Int16 to Float32 (-1.0 to 1.0)
+                for (let i = 0; i < int16Array.length; i++) {
+                    float32Array[i] = int16Array[i] / 32768.0;
+                }
+
+                // Create audio buffer
+                const audioBuffer = audioContext.createBuffer(1, float32Array.length, 44100);
+                audioBuffer.getChannelData(0).set(float32Array);
+
+                // Play audio
+                const source = audioContext.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContext.destination);
+                source.start();
+            } catch (e) {
+                // Silently ignore audio decode errors
+            }
+        }
+
+        function stopAudio() {
+            if (audioWebsocket) {
+                audioWebsocket.close();
+                audioWebsocket = null;
+            }
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+        }
+
         // ==================== UTILITIES ====================
 
         function stopAll() {
@@ -370,7 +467,9 @@
                 hls = null;
             }
             player.style.display = 'none';
+            player.pause();
             player.src = '';
+            player.load(); // Reset player state
 
             // Stop WebSocket
             if (websocket) {
@@ -379,6 +478,9 @@
             }
             mirrorImg.style.display = 'none';
             mirrorCanvas.style.display = 'none';
+
+            // Stop Audio
+            stopAudio();
 
             hideLoading();
             hideError();
