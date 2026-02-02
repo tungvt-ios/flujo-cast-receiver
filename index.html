@@ -75,7 +75,7 @@
             color: rgba(255,255,255,0.7);
             font-family: monospace;
             font-size: 14px;
-            display: none;
+            display: block;
             background: rgba(0,0,0,0.5);
             padding: 10px;
             border-radius: 5px;
@@ -340,10 +340,31 @@
             }
         }
 
+        let pendingFrame = null;
+        let frameRequested = false;
+
         function displayFrame(data) {
             // Hide any errors when receiving frames
             hideError();
             hideLoading();
+
+            // Store latest frame (drop older frames if not yet rendered)
+            pendingFrame = data;
+
+            // Use requestAnimationFrame for smooth rendering
+            if (!frameRequested) {
+                frameRequested = true;
+                requestAnimationFrame(renderFrame);
+            }
+        }
+
+        function renderFrame() {
+            frameRequested = false;
+
+            if (!pendingFrame) return;
+
+            const data = pendingFrame;
+            pendingFrame = null;
 
             const blob = new Blob([data], { type: 'image/jpeg' });
             const url = URL.createObjectURL(blob);
@@ -546,9 +567,13 @@
             errorDiv.style.display = 'none';
         }
 
+        let statusHistory = [];
         function updateStatus(text) {
             console.log('[Status]', text);
-            // Status display is hidden in production
+            statusHistory.push(text);
+            if (statusHistory.length > 5) statusHistory.shift();
+            statusDiv.innerHTML = statusHistory.join('<br>');
+            statusDiv.style.display = 'block';
         }
 
         // Player events
@@ -574,7 +599,7 @@
 
         context.start(options);
         console.log('Flujo Cast Receiver started - supports HLS + WebSocket mirroring');
-        updateStatus('Receiver v2.2 ready');
+        updateStatus('Receiver v2.4 ready');
         updateStatus('Waiting for content...');
     </script>
 </body>
